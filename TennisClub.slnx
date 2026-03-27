@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="TennisClub.Client/TennisClub.Client.csproj" />
+  <Project Path="TennisClub.Service/TennisClub.Service.csproj" />
+  <Project Path="TennisClub.Shared/TennisClub.Shared.csproj" />
+</Solution>
