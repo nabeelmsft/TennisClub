@@ -3,6 +3,7 @@ using TennisClub.Service.Services;
 using TennisClub.Shared;
 using TennisClub.Shared.Messages;
 using TennisClub.Shared.Messages.Payloads;
+using TennisClub.Shared.Models;
 
 namespace TennisClub.Service.Handlers;
 
@@ -10,11 +11,13 @@ public class MessageHandler
 {
     private readonly MemberService _members;
     private readonly BookingService _bookings;
+    private readonly ConnectionManager _connections;
 
-    public MessageHandler(MemberService members, BookingService bookings)
+    public MessageHandler(MemberService members, BookingService bookings, ConnectionManager connections)
     {
         _members = members;
         _bookings = bookings;
+        _connections = connections;
     }
 
     public WebSocketResponse Handle(WebSocketMessage message) =>
@@ -59,7 +62,30 @@ public class MessageHandler
         var (success, error, booking) = _bookings.Book(
             payload.CourtNumber, m1.Id, m1.Name, m2.Id, m2.Name, payload.Date, payload.StartHour);
 
-        return success ? Ok(msg, booking!) : Error(msg, error!);
+        if (success)
+        {
+            // Fire-and-forget: push the new booking to every connected client.
+            // The requesting client gets the normal Ok() response AND the broadcast.
+            // Other clients receive only the broadcast — with no matching RequestId,
+            // their WebSocketClient routes it to the PushReceived event instead.
+            _ = BroadcastBookingAsync(booking!);
+            return Ok(msg, booking!);
+        }
+
+        return Error(msg, error!);
+    }
+
+    private async Task BroadcastBookingAsync(Booking booking)
+    {
+        var push = new WebSocketResponse
+        {
+            RequestId = string.Empty,   // No pending request to match — clients route by absence
+            Type = MessageType.BookingBroadcast,
+            Success = true,
+            Data = booking
+        };
+        var json = JsonSerializer.Serialize(push, JsonConfig.Options);
+        await _connections.BroadcastAsync(json);
     }
 
     private WebSocketResponse HandleGetBookings(WebSocketMessage msg) =>

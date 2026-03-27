@@ -143,6 +143,21 @@
                 </DockPanel>
             </TabItem>
 
+            <!-- ── Tab 5: Live Feed ── -->
+            <TabItem Header="Live Feed">
+                <DockPanel Margin="8">
+                    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
+                        <TextBlock VerticalAlignment="Center" FontStyle="Italic" Foreground="Gray"
+                                   Text="Server-push messages appear here automatically when any client makes a booking."/>
+                        <Button Content="Clear" Margin="12,0,0,0" Padding="10,3" Click="ClearFeed_Click"/>
+                    </StackPanel>
+                    <ListBox x:Name="LiveFeedListBox"
+                             FontFamily="Consolas" FontSize="12"
+                             Background="#1E1E1E" Foreground="#D4D4D4"
+                             BorderThickness="1" BorderBrush="#444"/>
+                </DockPanel>
+            </TabItem>
+
         </TabControl>
     </DockPanel>
 </Window>

@@ -2,6 +2,7 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using TennisClub.Service;
 using TennisClub.Service.Handlers;
 using TennisClub.Service.Services;
 using TennisClub.Shared;
@@ -9,7 +10,8 @@ using TennisClub.Shared.Messages;
 
 var memberService = new MemberService();
 var bookingService = new BookingService();
-var handler = new MessageHandler(memberService, bookingService);
+var connections = new ConnectionManager();
+var handler = new MessageHandler(memberService, bookingService, connections);
 
 var listener = new HttpListener();
 listener.Prefixes.Add("http://localhost:5000/");
@@ -22,7 +24,7 @@ while (true)
 {
     var context = await listener.GetContextAsync();
     if (context.Request.IsWebSocketRequest)
-        _ = Task.Run(() => HandleClientAsync(context, handler));
+        _ = Task.Run(() => HandleClientAsync(context, handler, connections));
     else
     {
         context.Response.StatusCode = 400;
@@ -30,12 +32,13 @@ while (true)
     }
 }
 
-static async Task HandleClientAsync(HttpListenerContext context, MessageHandler handler)
+static async Task HandleClientAsync(HttpListenerContext context, MessageHandler handler, ConnectionManager connections)
 {
     var wsContext = await context.AcceptWebSocketAsync(null);
     var ws = wsContext.WebSocket;
     Console.WriteLine($"Client connected from {context.Request.RemoteEndPoint}");
 
+    var connectionId = connections.Add(ws);
     var buffer = new byte[8192];
     try
     {
@@ -69,6 +72,10 @@ static async Task HandleClientAsync(HttpListenerContext context, MessageHandler 
     catch (Exception ex)
     {
         Console.WriteLine($"Error handling client: {ex.Message}");
+    }
+    finally
+    {
+        connections.Remove(connectionId);
     }
 
     Console.WriteLine($"Client disconnected from {context.Request.RemoteEndPoint}");

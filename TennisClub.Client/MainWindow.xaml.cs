@@ -16,6 +16,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<Member> _members = [];
     private readonly ObservableCollection<CourtAvailability> _availability = [];
     private readonly ObservableCollection<Booking> _bookings = [];
+    private readonly ObservableCollection<string> _liveFeed = [];
 
     public MainWindow()
     {
@@ -25,6 +26,10 @@ public partial class MainWindow : Window
         BookingsGrid.ItemsSource = _bookings;
         Member1ComboBox.ItemsSource = _members;
         Member2ComboBox.ItemsSource = _members;
+        LiveFeedListBox.ItemsSource = _liveFeed;
+
+        // Subscribe before connecting so no push is missed
+        _client.PushReceived += OnPushReceived;
         _ = ConnectAsync();
     }
 
@@ -200,6 +205,35 @@ public partial class MainWindow : Window
             MessageBox.Show(ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
+
+    // ── Tab 5: Live Feed ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Called on a thread-pool thread by WebSocketClient whenever the server sends
+    /// an unsolicited push message (RequestId is empty — no pending TCS to match).
+    /// We marshal back to the UI thread via Dispatcher.Invoke before touching collections.
+    /// </summary>
+    private void OnPushReceived(WebSocketResponse response)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            if (response.Type == MessageType.BookingBroadcast)
+            {
+                var booking = response.GetData<Booking>();
+                if (booking is null) return;
+
+                // Add a timestamped line to the live feed
+                var line = $"[{DateTime.Now:HH:mm:ss}]  ▶  Court {booking.CourtNumber}  {booking.TimeSlotDisplay}  —  {booking.Member1Name}  +  {booking.Member2Name}";
+                _liveFeed.Insert(0, line); // newest at top
+
+                // Keep the Bookings tab up-to-date without a manual refresh
+                if (!_bookings.Any(b => b.Id == booking.Id))
+                    _bookings.Add(booking);
+            }
+        });
+    }
+
+    private void ClearFeed_Click(object sender, RoutedEventArgs e) => _liveFeed.Clear();
 
     // ── Tab selection ────────────────────────────────────────────────────────
 

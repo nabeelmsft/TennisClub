@@ -10,5 +10,9 @@ public enum MessageType
     GetMembers,
     GetAvailability,
     BookCourt,
-    GetBookings
+    GetBookings,
+
+    // Server-push: broadcast to ALL connected clients when any booking is confirmed.
+    // No RequestId is matched on the client side — it arrives unsolicited.
+    BookingBroadcast
 }

@@ -20,6 +20,13 @@ public class WebSocketClient : IAsyncDisposable
         _ = Task.Run(ReceiveLoopAsync);
     }
 
+    /// <summary>
+    /// Raised when the server sends a message that has no matching pending RequestId.
+    /// This is a server-initiated push — the client never asked for it.
+    /// The handler runs on a thread-pool thread; marshal to the UI thread if needed.
+    /// </summary>
+    public event Action<WebSocketResponse>? PushReceived;
+
     public async Task<WebSocketResponse> SendAsync(WebSocketMessage message)
     {
         var tcs = new TaskCompletionSource<WebSocketResponse>();
@@ -52,8 +59,12 @@ public class WebSocketClient : IAsyncDisposable
 
                 var json = Encoding.UTF8.GetString(ms.ToArray());
                 var response = JsonSerializer.Deserialize<WebSocketResponse>(json, JsonConfig.Options);
-                if (response is not null && _pending.TryRemove(response.RequestId, out var tcs))
-                    tcs.SetResult(response);
+                if (response is null) continue;
+
+                if (_pending.TryRemove(response.RequestId, out var tcs))
+                    tcs.SetResult(response);        // ← matched: a reply to our request
+                else
+                    PushReceived?.Invoke(response); // ← unmatched: server-initiated push
             }
         }
         catch (OperationCanceledException) { }
