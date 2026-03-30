@@ -27,8 +27,30 @@ public class WebSocketClient : IAsyncDisposable
     /// </summary>
     public event Action<WebSocketResponse>? PushReceived;
 
+    /// <summary>
+    /// Optional confirmation gate for write operations.
+    /// When set, this callback is awaited before every message whose
+    /// <see cref="MessageTypeExtensions.IsWriteOperation"/> returns true.
+    /// Return true  → the message is sent normally.
+    /// Return false → sending is cancelled; SendAsync throws OperationCanceledException.
+    /// If left null, all write operations proceed without confirmation.
+    /// </summary>
+    public Func<MessageType, Task<bool>>? ConfirmWriteAsync { get; set; }
+
     public async Task<WebSocketResponse> SendAsync(WebSocketMessage message)
     {
+        // ── Confirmation gate ────────────────────────────────────────────────
+        // Before touching the socket, give the caller a chance to cancel any
+        // operation that mutates server state. Non-write (read) operations skip
+        // this check entirely and go straight to the wire.
+        if (message.Type.IsWriteOperation() && ConfirmWriteAsync is not null)
+        {
+            var confirmed = await ConfirmWriteAsync(message.Type);
+            if (!confirmed)
+                throw new OperationCanceledException($"{message.Type.GetDisplayName()} was cancelled by the user.");
+        }
+
+        // ── Normal send / response-correlation path ──────────────────────────
         var tcs = new TaskCompletionSource<WebSocketResponse>();
         _pending[message.RequestId] = tcs;
 

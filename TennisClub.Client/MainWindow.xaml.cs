@@ -30,6 +30,19 @@ public partial class MainWindow : Window
 
         // Subscribe before connecting so no push is missed
         _client.PushReceived += OnPushReceived;
+
+        // Confirmation gate: called automatically by WebSocketClient before every
+        // write operation. Non-write (Get*) messages bypass this entirely.
+        _client.ConfirmWriteAsync = type =>
+        {
+            var result = MessageBox.Show(
+                $"You are about to perform a write operation:\n\n    \u2022  {type.GetDisplayName()}\n\nDo you want to continue?",
+                "Confirm Write Operation",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            return Task.FromResult(result == MessageBoxResult.Yes);
+        };
+
         _ = ConnectAsync();
     }
 
@@ -78,6 +91,7 @@ public partial class MainWindow : Window
                 MessageBox.Show(response.Error ?? "Sign up failed.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
+        catch (OperationCanceledException) { /* user chose No — nothing to report */ }
         catch (Exception ex)
         {
             MessageBox.Show(ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -180,13 +194,14 @@ public partial class MainWindow : Window
             else
                 MessageBox.Show(response.Error ?? "Booking failed.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
+        catch (OperationCanceledException) { /* user chose No — nothing to report */ }
         catch (Exception ex)
         {
             MessageBox.Show(ex.Message, "Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
-    // ── Tab 4: Bookings ──────────────────────────────────────────────────────
+    // ── Tab 4: Bookings
 
     private async void RefreshBookings_Click(object sender, RoutedEventArgs e)
     {
@@ -206,7 +221,7 @@ public partial class MainWindow : Window
         }
     }
 
-    // ── Tab 5: Live Feed ──────────────────────────────────────────────────────
+    // ── Tab 5: Live Feed
 
     /// <summary>
     /// Called on a thread-pool thread by WebSocketClient whenever the server sends
