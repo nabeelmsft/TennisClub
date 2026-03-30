@@ -36,6 +36,8 @@ public static class MessageTypeExtensions
             MessageType.BookCourt         => "Book a Court",
             MessageType.GetBookings       => "Get Bookings",
             MessageType.BookingBroadcast  => "Booking Broadcast",
+            MessageType.Ping              => "Heartbeat Ping",
+            MessageType.Pong              => "Heartbeat Pong",
             _                             => type.ToString()
         };
 }

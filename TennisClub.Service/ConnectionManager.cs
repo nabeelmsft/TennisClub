@@ -6,40 +6,61 @@ namespace TennisClub.Service;
 
 /// <summary>
 /// Keeps a thread-safe registry of every connected WebSocket client.
-/// Any part of the server can call BroadcastAsync to push a JSON message
-/// to all clients simultaneously — no request needed from the clients.
-/// This is the key feature that separates WebSockets from HTTP.
+/// Each entry pairs the socket with a SemaphoreSlim(1,1) send-lock so that
+/// three concurrent writers — the response send in HandleClientAsync, the
+/// heartbeat ping from HeartbeatMonitor, and BroadcastAsync — can never call
+/// WebSocket.SendAsync on the same socket at the same time (which would throw).
 /// </summary>
 public class ConnectionManager
 {
-    private readonly ConcurrentDictionary<Guid, WebSocket> _sockets = new();
+    private readonly ConcurrentDictionary<Guid, (WebSocket Socket, SemaphoreSlim SendLock)> _clients = new();
 
-    public Guid Add(WebSocket socket)
+    /// <summary>
+    /// Registers a new WebSocket and returns its unique ID together with the
+    /// exclusive send-lock that every writer for this connection must acquire.
+    /// </summary>
+    public (Guid Id, SemaphoreSlim SendLock) Add(WebSocket socket)
     {
         var id = Guid.NewGuid();
-        _sockets[id] = socket;
-        Console.WriteLine($"[ConnectionManager] Client registered. Total: {_sockets.Count}");
-        return id;
+        var sendLock = new SemaphoreSlim(1, 1);
+        _clients[id] = (socket, sendLock);
+        Console.WriteLine($"[ConnectionManager] Client registered. Total: {_clients.Count}");
+        return (id, sendLock);
     }
 
     public void Remove(Guid id)
     {
-        _sockets.TryRemove(id, out _);
-        Console.WriteLine($"[ConnectionManager] Client removed. Total: {_sockets.Count}");
+        if (_clients.TryRemove(id, out var entry))
+            entry.SendLock.Dispose();
+        Console.WriteLine($"[ConnectionManager] Client removed. Total: {_clients.Count}");
     }
 
+    /// <summary>
+    /// Sends <paramref name="json"/> to every open client.
+    /// Each send acquires the per-socket lock to avoid racing with the heartbeat
+    /// pings or in-flight response writes on the same socket.
+    /// </summary>
     public async Task BroadcastAsync(string json)
     {
         var bytes = Encoding.UTF8.GetBytes(json);
         var segment = new ArraySegment<byte>(bytes);
 
-        // Send to every open socket in parallel.
-        // Sockets that are closed or faulted are skipped silently.
-        var tasks = _sockets.Values
-            .Where(ws => ws.State == WebSocketState.Open)
-            .Select(ws => ws.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None));
+        var tasks = _clients.Values
+            .Where(c => c.Socket.State == WebSocketState.Open)
+            .Select(async c =>
+            {
+                await c.SendLock.WaitAsync();
+                try
+                {
+                    await c.Socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                finally
+                {
+                    c.SendLock.Release();
+                }
+            });
 
         await Task.WhenAll(tasks);
-        Console.WriteLine($"[ConnectionManager] Broadcast sent to {_sockets.Count} client(s).");
+        Console.WriteLine($"[ConnectionManager] Broadcast sent to {_clients.Count} client(s).");
     }
 }

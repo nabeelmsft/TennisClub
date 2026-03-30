@@ -14,5 +14,11 @@ public enum MessageType
 
     // Server-push: broadcast to ALL connected clients when any booking is confirmed.
     // No RequestId is matched on the client side — it arrives unsolicited.
-    BookingBroadcast
+    BookingBroadcast,
+
+    // Heartbeat pair — infrastructure only, never routed to MessageHandler.
+    // Server → Client: sent every 10 s to detect silently dropped connections.
+    Ping,
+    // Client → Server: reply to a Ping; server records the timestamp.
+    Pong
 }

@@ -38,7 +38,17 @@ static async Task HandleClientAsync(HttpListenerContext context, MessageHandler 
     var ws = wsContext.WebSocket;
     Console.WriteLine($"Client connected from {context.Request.RemoteEndPoint}");
 
-    var connectionId = connections.Add(ws);
+    // Register the socket and get back both its ID and its exclusive send-lock.
+    // The lock is shared with HeartbeatMonitor and ConnectionManager.BroadcastAsync
+    // so that only one writer ever calls ws.SendAsync at a time.
+    var (connectionId, sendLock) = connections.Add(ws);
+
+    // Start the heartbeat monitor for this connection on a background task.
+    // The CancellationTokenSource lets us shut it down cleanly in the finally block.
+    using var cts = new CancellationTokenSource();
+    var heartbeat     = new HeartbeatMonitor(ws, sendLock, connectionId);
+    var heartbeatTask = Task.Run(() => heartbeat.RunAsync(cts.Token));
+
     var buffer = new byte[8192];
     try
     {
@@ -63,10 +73,31 @@ static async Task HandleClientAsync(HttpListenerContext context, MessageHandler 
             var message = JsonSerializer.Deserialize<WebSocketMessage>(json, JsonConfig.Options);
             if (message is null) continue;
 
-            var response = handler.Handle(message);
-            var responseJson = JsonSerializer.Serialize(response, JsonConfig.Options);
+            // Pong is infrastructure — record the timestamp and skip MessageHandler.
+            // This keeps heartbeat logic out of the application-level handler.
+            if (message.Type == MessageType.Pong)
+            {
+                heartbeat.RecordPong();
+                Console.WriteLine($"[Heartbeat] Pong ← {connectionId}");
+                continue;
+            }
+
+            var response      = handler.Handle(message);
+            var responseJson  = JsonSerializer.Serialize(response, JsonConfig.Options);
             var responseBytes = Encoding.UTF8.GetBytes(responseJson);
-            await ws.SendAsync(new ArraySegment<byte>(responseBytes), WebSocketMessageType.Text, true, CancellationToken.None);
+
+            // Acquire the per-socket send-lock before writing.
+            // HeartbeatMonitor.SendPingAsync and BroadcastAsync both compete for
+            // this socket; the lock guarantees only one writer is active at a time.
+            await sendLock.WaitAsync();
+            try
+            {
+                await ws.SendAsync(new ArraySegment<byte>(responseBytes), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            finally
+            {
+                sendLock.Release();
+            }
         }
     }
     catch (Exception ex)
@@ -75,6 +106,10 @@ static async Task HandleClientAsync(HttpListenerContext context, MessageHandler 
     }
     finally
     {
+        // Cancel the heartbeat loop and wait for it to finish before removing
+        // the connection from the registry (which also disposes the send-lock).
+        cts.Cancel();
+        await heartbeatTask;
         connections.Remove(connectionId);
     }
 

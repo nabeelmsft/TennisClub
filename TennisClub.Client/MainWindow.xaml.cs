@@ -31,6 +31,13 @@ public partial class MainWindow : Window
         // Subscribe before connecting so no push is missed
         _client.PushReceived += OnPushReceived;
 
+        // Show reconnection status in the status bar.
+        // Both events fire on a thread-pool thread, so we marshal to the UI thread.
+        _client.Reconnecting += attempt => Dispatcher.Invoke(() =>
+            StatusText.Text = $"Connection lost \u2014 reconnecting\u2026 (attempt {attempt}/5)");
+        _client.Reconnected += () =>
+            Dispatcher.Invoke(() => StatusText.Text = "Reconnected to server.");
+
         // Confirmation gate: called automatically by WebSocketClient before every
         // write operation. Non-write (Get*) messages bypass this entirely.
         _client.ConfirmWriteAsync = type =>

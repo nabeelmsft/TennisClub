@@ -587,3 +587,205 @@ To add a new write operation in the future:
 
 No changes are needed in `WebSocketClient`, `MessageHandler`, or any existing handler.
 
+
+
+---
+
+## 12. Ping/Pong Heartbeats
+
+### The Problem: Silent Drops
+
+A WebSocket connection can die without either side knowing. Consider:
+
+- A laptop goes to sleep mid-session.
+- A home router drops idle connections after 30-60 s (NAT table expiry).
+- A mobile device roams from Wi-Fi to cellular.
+
+In all these cases the TCP connection is gone but the OS has not sent a FIN packet.
+Both sides still *think* the socket is open. The server holds the object in memory
+forever — a **zombie connection**.
+
+### The Fix: Application-Level Ping/Pong
+
+Every 10 seconds the server sends a `Ping` message.
+The client replies with a `Pong` within 25 seconds.
+If no Pong arrives the server closes its end and reclaims the slot.
+
+### Why Not RFC-6455 Protocol-Level Ping Frames?
+
+The WebSocket spec defines control frames (opcode 0x9/0xA) for this purpose.
+The .NET `ClientWebSocket` does **not** expose an API to send or receive them.
+Using a regular JSON message achieves the same result while staying entirely
+inside the existing message pipeline.
+
+### The Concurrent-Send Problem
+
+Three code paths can write to the same `WebSocket` simultaneously:
+
+| Writer | When |
+|---|---|
+| `HandleClientAsync` | Sending a response |
+| `HeartbeatMonitor.SendPingAsync` | Every 10 s |
+| `ConnectionManager.BroadcastAsync` | After every booking |
+
+`WebSocket.SendAsync` throws if called concurrently on one instance.
+The solution is a **per-socket `SemaphoreSlim(1,1)`** shared between all three writers.
+
+### Server-Side Flow
+
+```csharp
+// HandleClientAsync in Program.cs
+
+var (connectionId, sendLock) = connections.Add(ws);   // socket + its exclusive lock
+var heartbeat = new HeartbeatMonitor(ws, sendLock, connectionId);
+var heartbeatTask = Task.Run(() => heartbeat.RunAsync(cts.Token));
+
+// In the receive loop — intercept Pong before routing:
+if (message.Type == MessageType.Pong)
+{
+    heartbeat.RecordPong();   // Interlocked.Exchange on _lastPongTicks
+    continue;                 // never reaches MessageHandler
+}
+
+// Response send — acquire the shared lock first:
+await sendLock.WaitAsync();
+try   { await ws.SendAsync(...); }
+finally { sendLock.Release(); }
+
+// Cleanup — cancel the heartbeat and wait before removing the connection:
+cts.Cancel();
+await heartbeatTask;
+connections.Remove(connectionId);   // also disposes the SemaphoreSlim
+```
+
+### Client-Side Flow
+
+```csharp
+// WebSocketClient.ReceiveLoopAsync
+
+if (response.Type == MessageType.Ping)
+{
+    _ = Task.Run(SendPongAsync);   // reply on a background thread
+    continue;                      // skip _pending routing
+}
+
+// SendPongAsync uses the same _sendLock as SendAsync:
+await _sendLock.WaitAsync(_cts.Token);
+try   { await _ws.SendAsync(pong, ...); }
+finally { _sendLock.Release(); }
+```
+
+### Why `long` Ticks Instead of `volatile DateTime`
+
+`volatile` fields must be reference types or certain primitive types. `DateTime`
+is a struct and is not volatile-compatible. Storing UTC ticks as `long` and using
+`Interlocked` gives lock-free atomic read/write:
+
+```csharp
+private long _lastPongTicks = DateTime.UtcNow.Ticks;
+
+public void RecordPong()
+    => Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
+
+// Inside RunAsync:
+if (DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastPongTicks) > Timeout.Ticks)
+    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Heartbeat timeout", ...);
+```
+
+---
+
+## 13. Reconnection Logic
+
+### The Problem: Server Restarts
+
+When the server restarts or the network blips, the client's `ReceiveLoopAsync`
+exits. Without reconnection logic the user must restart the whole application.
+
+### The Fix: Auto-Reconnect with Exponential Back-off
+
+When the receive loop exits normally (not because `DisposeAsync` cancelled it),
+it calls `ReconnectAsync`:
+
+```csharp
+// End of ReceiveLoopAsync:
+if (!_cts.IsCancellationRequested)
+    await ReconnectAsync();
+```
+
+Hammering a down server with immediate retries wastes resources and can worsen
+an outage. Back-off gives the server time to recover:
+
+| Attempt | Delay |
+|---|---|
+| 1 | 2 s |
+| 2 | 4 s |
+| 3 | 8 s |
+| 4 | 16 s |
+| 5 | 30 s (capped) |
+
+```csharp
+var delay = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt), 30));
+```
+
+### Replacing the WebSocket Instance
+
+`ClientWebSocket` is single-use — once it enters an `Aborted`/`Closed` state it
+cannot be reconnected. `ReconnectAsync` disposes the dead instance and creates a
+fresh one:
+
+```csharp
+_ws.Dispose();
+_ws = new ClientWebSocket();                    // _ws is non-readonly for this reason
+await _ws.ConnectAsync(new Uri(_url!), token);
+_ = Task.Run(ReceiveLoopAsync);                // restart the receive loop
+Reconnected?.Invoke();
+```
+
+### UI Feedback via Events
+
+Two events decouple the reconnection logic from the UI layer:
+
+```csharp
+public event Action<int>? Reconnecting;   // fired at the start of each attempt
+public event Action?      Reconnected;    // fired on success
+```
+
+Both fire on a thread-pool thread. `MainWindow.xaml.cs` marshals to the UI thread:
+
+```csharp
+_client.Reconnecting += attempt => Dispatcher.Invoke(() =>
+    StatusText.Text = $"Connection lost — reconnecting… (attempt {attempt}/5)");
+_client.Reconnected += () =>
+    Dispatcher.Invoke(() => StatusText.Text = "Reconnected to server.");
+```
+
+### Exhausted Retries
+
+If all five attempts fail, every pending `TaskCompletionSource` is faulted so
+callers do not wait forever:
+
+```csharp
+var error = new Exception($"Could not reconnect after {MaxReconnectAttempts} attempts.");
+foreach (var tcs in _pending.Values)
+    tcs.TrySetException(error);
+```
+
+### Timeline
+
+```
+Client                              Server
+  |                                   |
+  |  Connection drops                 X   (restart / NAT timeout)
+  |  ReceiveLoopAsync exits           |
+  |  ReconnectAsync() called          |
+  |                                   |
+  |  [2 s] attempt 1                  |   (server still starting)
+  |  ConnectAsync ─────────────────▶  X   (connection refused)
+  |                                   |
+  |  [4 s] attempt 2                  |   (server ready)
+  |  ConnectAsync ─────────────────▶  |
+  |             ◀── Upgrade ──────    |
+  |  ReceiveLoopAsync restarted       |
+  |  Reconnected?.Invoke()            |
+  |  StatusText = "Reconnected"       |
+```
