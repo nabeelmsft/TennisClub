@@ -17,6 +17,16 @@ WebSocket patterns used. It is written for developers who are new to WebSockets.
 8. [Server-Push Broadcasting](#8-server-push-broadcasting)
 9. [Full Message Flow Diagrams](#9-full-message-flow-diagrams)
 10. [Threading Model](#10-threading-model)
+11. [Write-Operation Confirmation Gate](#11-write-operation-confirmation-gate)
+2. [Application Architecture](#2-application-architecture)
+3. [The Message Envelope Pattern](#3-the-message-envelope-pattern)
+4. [The Core Problem: No Built-in Request/Response](#4-the-core-problem-no-built-in-requestresponse)
+5. [The Solution: TaskCompletionSource + Pending Dictionary](#5-the-solution-taskcompletionsource--pending-dictionary)
+6. [SendAsync — Line by Line](#6-sendasync--line-by-line)
+7. [ReceiveLoopAsync — The Other Half](#7-receiveloopasync--the-other-half)
+8. [Server-Push Broadcasting](#8-server-push-broadcasting)
+9. [Full Message Flow Diagrams](#9-full-message-flow-diagrams)
+10. [Threading Model](#10-threading-model)
 
 ---
 
@@ -415,3 +425,165 @@ The critical rule: **WPF controls may only be read or written on the UI thread.*
 Because `PushReceived` fires on a background thread, `OnPushReceived` uses
 `Dispatcher.Invoke` to cross back to the UI thread before updating `_liveFeed`
 or `_bookings`.
+
+---
+
+## 11. Write-Operation Confirmation Gate
+
+### The problem
+
+As the application grows, any developer adding a new button could accidentally fire a
+destructive server call without the user being asked to confirm. Putting a
+`MessageBox.Show` in every write handler works, but it scatters the policy across the
+codebase and makes it easy to forget.
+
+### Design goals
+
+1. Declare write operations **once**, in one place.
+2. Intercept them **automatically** — new write handlers get confirmation for free.
+3. Keep UI concerns (the `MessageBox`) out of the network/transport layer.
+
+---
+
+### Part 1 — Single source of truth (`MessageTypeExtensions.cs`, Shared project)
+
+```csharp
+private static readonly HashSet<MessageType> WriteOperations =
+[
+    MessageType.SignUp,
+    MessageType.BookCourt
+];
+
+public static bool IsWriteOperation(this MessageType type) =>
+    WriteOperations.Contains(type);
+
+public static string GetDisplayName(this MessageType type) =>
+    type switch
+    {
+        MessageType.SignUp   => "Register New Member",
+        MessageType.BookCourt => "Book a Court",
+        ...
+    };
+```
+
+A `HashSet<MessageType>` is the registry. Adding a new write operation in the future
+means adding one line to this set — nothing else needs to change anywhere.
+
+The extension method `IsWriteOperation()` lives in the **Shared** project because the
+rule "what is a write operation" is domain knowledge, not UI knowledge or transport
+knowledge. Both layers can reference it without depending on each other.
+
+`GetDisplayName()` provides a human-readable label used in confirmation dialogs and
+log messages, keeping display strings co-located with the type they describe.
+
+---
+
+### Part 2 — Confirmation callback (`WebSocketClient.cs`, Client project)
+
+```csharp
+/// <summary>
+/// Optional confirmation gate for write operations.
+/// Return true  → the message is sent normally.
+/// Return false → SendAsync throws OperationCanceledException.
+/// </summary>
+public Func<MessageType, Task<bool>>? ConfirmWriteAsync { get; set; }
+
+public async Task<WebSocketResponse> SendAsync(WebSocketMessage message)
+{
+    if (message.Type.IsWriteOperation() && ConfirmWriteAsync is not null)
+    {
+        var confirmed = await ConfirmWriteAsync(message.Type);
+        if (!confirmed)
+            throw new OperationCanceledException(...);
+    }
+    // ... normal send path
+}
+```
+
+`WebSocketClient` is a **transport layer** concern — it manages bytes on a wire. It
+should not know what a `MessageBox` is. The `Func<MessageType, Task<bool>>` delegate
+is a seam: the transport layer knows *when* to ask for confirmation (any write
+operation), but it delegates *how* to whoever owns the client.
+
+This is the **Strategy pattern** applied to a single method: swap the delegate and
+you swap the confirmation behaviour without touching the transport code.
+The `Task<bool>` return type makes the callback async-safe — a future implementation
+could show a custom animated dialog and `await` user input.
+
+---
+
+### Part 3 — Wiring the UI (`MainWindow.xaml.cs`, Client project)
+
+```csharp
+_client.ConfirmWriteAsync = type =>
+{
+    var result = MessageBox.Show(
+        $"You are about to perform a write operation:\n\n    •  {type.GetDisplayName()}\n\nDo you want to continue?",
+        "Confirm Write Operation",
+        MessageBoxButton.YesNo,
+        MessageBoxImage.Question);
+    return Task.FromResult(result == MessageBoxResult.Yes);
+};
+```
+
+The UI layer owns the *policy* (show a `MessageBox`) and assigns it to the transport
+layer's callback property. `Task.FromResult(...)` wraps the synchronous `MessageBox`
+result in a completed `Task<bool>` to satisfy the async delegate signature.
+
+Because `ConfirmWriteAsync` is awaited inside `SendAsync`, and `SendAsync` is always
+called from a button-click handler (which runs on the **UI thread**), the callback
+itself also executes on the UI thread — `MessageBox.Show` is safe without any
+`Dispatcher` marshalling.
+
+---
+
+### Part 4 — Handling cancellation in write handlers
+
+When the user clicks **No**, `SendAsync` throws `OperationCanceledException`. Write
+handlers catch it silently — it is not an error, it is a deliberate user choice:
+
+```csharp
+private async void SignUp_Click(object sender, RoutedEventArgs e)
+{
+    try
+    {
+        var response = await _client.SendAsync(...);
+        // handle success
+    }
+    catch (OperationCanceledException) { /* user chose No — nothing to report */ }
+    catch (Exception ex)
+    {
+        MessageBox.Show(ex.Message, "Error", ...); // genuine errors still surface
+    }
+}
+```
+
+Read handlers (`RefreshMembers_Click`, `CheckAvailability_Click`, etc.) do **not**
+catch `OperationCanceledException` because `IsWriteOperation()` returns `false` for
+them — `SendAsync` never throws for read operations.
+
+---
+
+### Confirmation behaviour at a glance
+
+| Operation | Write? | Confirmation shown |
+|---|---|---|
+| Sign Up | ✅ | Yes — "Register New Member" |
+| Book a Court | ✅ | Yes — "Book a Court" |
+| Get Members | ❌ | No |
+| Check Availability | ❌ | No |
+| Get Bookings | ❌ | No |
+
+---
+
+### Extending the gate
+
+To add a new write operation in the future:
+
+1. Add the new `MessageType` value to the `WriteOperations` `HashSet` in
+   `MessageTypeExtensions.cs`.
+2. Add a display name entry to the `GetDisplayName` switch expression.
+3. Add `catch (OperationCanceledException) { }` to the new handler.
+
+No changes are needed in `WebSocketClient`, `MessageHandler`, or any existing handler.
+
