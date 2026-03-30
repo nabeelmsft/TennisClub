@@ -2,6 +2,10 @@
 
 A .NET 8 application for managing tennis club memberships and court bookings.
 
+## Documentation
+
+- **[WebSocket Architecture & Key Concepts](docs/WebSocketArchitecture.md)** — deep-dive into the request/response correlation pattern (`TaskCompletionSource` + `_pending` dictionary), server-push broadcasting, WebSocket framing, and the threading model
+
 ## Projects
 
 | Project | Type | Description |
